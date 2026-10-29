@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/epcc-core", "crates/epcc-cli", "crates/epcc-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/EPCCdev/EPCC"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+debug = false
+
+# The test suite pushes millions of points through every format; unoptimised builds are too slow for that.
+[profile.test]
+opt-level = 2

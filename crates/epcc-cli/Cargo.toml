@@ -1,0 +1,18 @@
+[package]
+name = "epcc-cli"
+description = "Command line front end of EPCC."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "epcc"
+path = "src/main.rs"
+
+[dependencies]
+epcc-core = { path = "../epcc-core" }
+lexopt = "0.3.2"
+
+[target."cfg(windows)".build-dependencies]
+winresource = "0.1.34"
