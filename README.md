@@ -12,7 +12,7 @@ format, press *Convert*. Free, nothing to install, works offline, on Windows, ma
 </p>
 <p align="center"><sub>Always the latest version. Older versions and change notes are on the <a href="https://github.com/EPCCdev/EPCC/releases">releases page</a>.</sub></p>
 
-<p align="center"><img src="docs/images/window.png" alt="The EPCC window with four scans ready to convert" width="780"></p>
+<p align="center"><img src="docs/images/demo.gif" alt="Converting a scan with EPCC: start it, add the file, choose the format, convert" width="780"></p>
 
 ## What it does
 
@@ -57,11 +57,6 @@ it:
 4. **Click *Convert*.** Each file shows its progress, then how many points were written.
 
 <p align="center"><img src="docs/images/converted.png" alt="Four files converted" width="780"></p>
-
-<!-- Animation of dragging files in and converting: save it as docs/images/drag-and-drop.gif and
-     uncomment the next line.
-<p align="center"><img src="docs/images/drag-and-drop.gif" alt="Dragging scans into EPCC and converting them" width="780"></p>
--->
 
 If a file with the new name already exists, EPCC keeps both by adding a number, unless you
 choose otherwise in the settings. Potree output is a folder rather than a file; an existing

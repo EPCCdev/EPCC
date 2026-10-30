@@ -956,7 +956,7 @@ checksum = "cfc1cc505827f4c23eedc297975a0fd038268d41293f389dd8ff3b574aefab19"
 
 [[package]]
 name = "epcc-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "epcc-core",
  "lexopt",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "epcc-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "e57",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "epcc-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "epcc-core",

@@ -165,16 +165,11 @@ fn drop_repeated(chunk: &mut PointChunk, last_kept: &mut Option<[f64; 3]>) {
 #[derive(Clone, Copy, Debug)]
 enum IntensityRule {
     /// The source intensity, scaled from its range onto 0..255.
-    Scaled {
-        min: f64,
-        max: f64,
-    },
+    Scaled { min: f64, max: f64 },
     /// Without intensity, the height, scaled from the cloud's range onto 0..255.
-    Height {
-        min: f64,
-        max: f64,
-    },
-    Zero,
+    Height { min: f64, max: f64 },
+    /// The same value for every point: 0 for constant intensity, 255 for a flat cloud without.
+    Constant(u8),
 }
 
 /// The cloud's frame and the conversion of its points, fixed once all points are staged.
@@ -213,11 +208,11 @@ impl Frame {
         let has_intensity = attributes.intensity && stats.any_intensity;
         let intensity = if has_intensity {
             let (min, max) = (f64::from(stats.intensity_min), f64::from(stats.intensity_max));
-            if max > min { IntensityRule::Scaled { min, max } } else { IntensityRule::Zero }
+            if max > min { IntensityRule::Scaled { min, max } } else { IntensityRule::Constant(0) }
         } else if stats.max[2] > stats.min[2] {
             IntensityRule::Height { min: stats.min[2], max: stats.max[2] }
         } else {
-            IntensityRule::Zero
+            IntensityRule::Constant(255)
         };
         let intensity_range =
             if attributes.intensity { [stats.intensity_min, stats.intensity_max] } else { [0.0, 0.0] };
@@ -249,17 +244,19 @@ impl Frame {
     fn point(&self, chunk: &PointChunk, index: usize) -> Point {
         let absolute = chunk.positions[index];
         let position = std::array::from_fn(|axis| absolute[axis] - self.centre[axis]);
-        let [red, green, blue] = chunk.color.as_ref().map_or([0; 3], |values| values[index].map(|c| (c >> 8) as u8));
         let scaled = |value: f64, min: f64, max: f64| (255.0 * (value - min) / (max - min)).floor() as u8;
         let intensity = match self.intensity {
             IntensityRule::Scaled { min, max } => {
                 chunk.intensity.as_ref().map_or(0, |values| scaled(f64::from(values[index]), min, max))
             }
             IntensityRule::Height { min, max } => scaled(absolute[2], min, max),
-            IntensityRule::Zero => 0,
+            IntensityRule::Constant(value) => value,
         };
+        // Without colour, the intensity is stored as grey.
+        let [red, green, blue] =
+            chunk.color.as_ref().map_or([intensity; 3], |values| values[index].map(|c| (c >> 8) as u8));
         let normal = chunk.normal.as_ref().map_or(0, |values| normals::encode(values[index].map(f64::from)));
-        Point { position, rgbi: [red, green, blue, intensity], normal }
+        Point { position, absolute, rgbi: [red, green, blue, intensity], normal }
     }
 }
 

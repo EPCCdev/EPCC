@@ -20,6 +20,8 @@ pub const MAX_POINTS: usize = RECORD_ORDER.len() / 4;
 pub struct Point {
     /// Position relative to the scan centre.
     pub position: [f64; 3],
+    /// Position as in the source, which normals are estimated from.
+    pub absolute: [f64; 3],
     /// Red, green, blue and intensity, 8 bits each.
     pub rgbi: [u8; 4],
     /// The source's normal code; 0 when the source has no normals.
@@ -54,7 +56,7 @@ pub fn build(min: [f64; 3], edge: f64, points: &[Point], estimate_normals: bool)
         std::array::from_fn(|axis| ((position[axis] - min[axis]) / cell).floor() as i64)
     };
 
-    // The point nearest its cell's centre survives; of equally near ones, the first.
+    // The point nearest its cell's centre survives; of equally near ones, the last.
     let cells: Vec<[i64; 3]> = points.iter().map(|point| cell_of(point.position)).collect();
     let mut ranked: Vec<(usize, f64)> = points
         .iter()
@@ -70,7 +72,7 @@ pub fn build(min: [f64; 3], edge: f64, points: &[Point], estimate_normals: bool)
             (index, distance)
         })
         .collect();
-    ranked.sort_unstable_by(|&(a, da), &(b, db)| cells[a].cmp(&cells[b]).then(da.total_cmp(&db)).then(a.cmp(&b)));
+    ranked.sort_unstable_by(|&(a, da), &(b, db)| cells[a].cmp(&cells[b]).then(da.total_cmp(&db)).then(b.cmp(&a)));
     let mut kept: Vec<usize> = Vec::new();
     for (rank, &(index, _)) in ranked.iter().enumerate() {
         if rank == 0 || cells[index] != cells[ranked[rank - 1].0] {
@@ -138,8 +140,8 @@ pub fn build(min: [f64; 3], edge: f64, points: &[Point], estimate_normals: bool)
         record_of[member as usize] = record as u32;
     }
     let normal_codes: Vec<u16> = if estimate_normals {
-        let positions: Vec<[f64; 3]> = kept.iter().map(|&index| points[index].position).collect();
-        normals::estimate_codes(&positions)
+        let positions: Vec<[f64; 3]> = kept.iter().map(|&index| points[index].absolute).collect();
+        normals::estimate_codes(&positions, edge)
     } else {
         kept.iter().map(|&index| points[index].normal).collect()
     };
@@ -260,12 +262,25 @@ mod tests {
 
     #[test]
     fn close_points_are_thinned_to_one_per_cell() {
-        let point = |x: f64| Point { position: [x, 0.0101, 0.0101], ..Point::default() };
+        let point = |x: f64, normal: u16| Point { position: [x, 0.0101, 0.0101], normal, ..Point::default() };
         // Edge 0.1 m: cells of 0.1 / 64 = 1.5625 mm. Both points share the first cell; the
         // one nearer its centre stays.
-        let block = build([0.0; 3], 0.1, &[point(0.0002), point(0.0008), point(0.05)], false).unwrap();
+        let block = build([0.0; 3], 0.1, &[point(0.0002, 1), point(0.0008, 2), point(0.05, 3)], false).unwrap();
         assert_eq!(block.stored, 2);
         assert_eq!(block.points_min[0], 0.0002);
         assert_eq!(block.points_max[0], 0.05);
+        assert_eq!(stored_normals(&block), [2, 3]);
+        // Of equally near points, the last stays.
+        let block = build([0.0; 3], 0.1, &[point(0.0008, 1), point(0.0008, 2), point(0.05, 3)], false).unwrap();
+        assert_eq!(stored_normals(&block), [2, 3]);
+    }
+
+    /// The normal codes of a block's records, sorted.
+    fn stored_normals(block: &Block) -> Vec<u16> {
+        let records = &block.bytes[block.bytes.len() - POINT_RECORD_SIZE * block.stored..];
+        let mut codes: Vec<u16> =
+            records.chunks(POINT_RECORD_SIZE).map(|record| u16::from_le_bytes([record[12], record[13]])).collect();
+        codes.sort_unstable();
+        codes
     }
 }

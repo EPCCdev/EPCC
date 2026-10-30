@@ -68,6 +68,8 @@ struct Summary {
     half_size: f64,
     leaf_edges: Vec<f64>,
     largest_leaf: u64,
+    /// Red, green, blue and intensity of every stored point.
+    rgbi: Vec<[u8; 4]>,
 }
 
 /// Checks the file's internal consistency and returns a summary.
@@ -100,6 +102,7 @@ fn check(file: &[u8]) -> Summary {
     let mut leaf_edges = Vec::new();
     let mut largest_leaf = 0;
     let mut cubes = Vec::new();
+    let mut rgbi = Vec::new();
     for leaf in 0..leaf_count {
         let record = &leaves[8 + leaf * LEAF_RECORD_SIZE..8 + (leaf + 1) * LEAF_RECORD_SIZE];
         let min = read_f64s::<3>(record, leaf_record::CUBE_MIN);
@@ -117,6 +120,8 @@ fn check(file: &[u8]) -> Summary {
         let block = &points[block_start..block_start + size];
         block_start += size;
         let word_count = (size - POINT_RECORD_SIZE * count) / 4;
+        let records = block[4 * word_count..].chunks(POINT_RECORD_SIZE);
+        rgbi.extend(records.map(|record| [record[11], record[10], record[9], record[8]]));
         assert_eq!(word_count as u32, inner.iter().sum::<u32>() + point_words.iter().sum::<u32>());
 
         // The inner octree: level by level, children counted from each level's start.
@@ -198,6 +203,7 @@ fn check(file: &[u8]) -> Summary {
         half_size,
         leaf_edges,
         largest_leaf,
+        rgbi,
     }
 }
 
@@ -281,4 +287,31 @@ fn identical_input_gives_identical_files() {
     let positions: Vec<[f64; 3]> = (0..5_000).map(|_| [next(), next(), next()]).collect();
     let chunk = cloud(positions, colour_and_intensity());
     assert!(write(vec![chunk.clone()], true) == write(vec![chunk], true));
+}
+
+#[test]
+fn colourless_points_store_their_intensity_as_grey() {
+    let mut next = random(5);
+    let positions: Vec<[f64; 3]> = (0..2_000).map(|_| [next(), next(), next()]).collect();
+    let file = write(vec![cloud(positions, Attributes { intensity: true, ..Attributes::NONE })], false);
+    assert_eq!(file[header::HAS_COLOR], 0);
+    let summary = check(&file);
+    assert!(
+        summary
+            .rgbi
+            .iter()
+            .all(|&[red, green, blue, intensity]| red == intensity && green == intensity && blue == intensity)
+    );
+    assert!(summary.rgbi.iter().any(|&[.., intensity]| intensity > 0));
+}
+
+#[test]
+fn flat_clouds_without_intensity_store_full_intensity() {
+    let mut next = random(6);
+    let positions: Vec<[f64; 3]> = (0..2_000).map(|_| [next(), next(), 2.0]).collect();
+    let summary = check(&write(vec![cloud(positions.clone(), Attributes::NONE)], false));
+    assert!(summary.rgbi.iter().all(|&values| values == [255; 4]));
+    let summary = check(&write(vec![cloud(positions, Attributes { color: true, ..Attributes::NONE })], false));
+    assert!(summary.rgbi.iter().all(|&[.., intensity]| intensity == 255));
+    assert!(summary.rgbi.iter().any(|&[red, ..]| red != 255));
 }

@@ -16,10 +16,11 @@ const CODES: usize = 6 * FACE_CODES;
 /// centre. Matches the codes consuming applications expect for given directions.
 const ENCODE_SCALE: f64 = 52.0 / 51.8;
 
-/// Leaves storing fewer points get no estimated normals.
+/// Leaves storing fewer points get no estimated normals. A normal is estimated from the smallest
+/// cube around its point that holds at least this many points, the point itself included.
 pub const MIN_POINTS: usize = 9;
-/// The neighbourhood a normal is estimated from, the point itself included.
-pub const NEIGHBOURS: usize = 16;
+/// The smallest such cube has a half edge of the leaf's edge halved this many times.
+const MAX_HALVINGS: i32 = 16;
 
 /// The two axes besides `axis`, in ascending order.
 fn other_axes(axis: usize) -> (usize, usize) {
@@ -42,6 +43,28 @@ pub fn encode(normal: [f64; 3]) -> u16 {
             axis = candidate;
         }
     }
+    encode_on_face(normal, axis)
+}
+
+/// The code of an estimated normal. Its components are compared in single precision, and of
+/// equally long ones y wins over x and x over z, as in the consuming applications' own files.
+fn encode_estimated(normal: [f64; 3]) -> u16 {
+    if !normal.iter().all(|value| value.is_finite()) {
+        return 0;
+    }
+    let length = normal.map(|value| (value as f32).abs());
+    let axis = if length[1] >= length[0] && length[1] >= length[2] {
+        1
+    } else if length[0] >= length[2] {
+        0
+    } else {
+        2
+    };
+    encode_on_face(normal, axis)
+}
+
+/// The code of a direction on the faces of `axis`.
+fn encode_on_face(normal: [f64; 3], axis: usize) -> u16 {
     let main = normal[axis];
     if main == 0.0 {
         return 0;
@@ -83,35 +106,45 @@ fn decode_cell(code: usize) -> [f32; 3] {
 
 /// Normal codes for the stored points of one leaf, in their order. Leaves with fewer than
 /// [`MIN_POINTS`] points get code 0 throughout.
-pub fn estimate_codes(points: &[[f64; 3]]) -> Vec<u16> {
-    let count = points.len();
-    if count < MIN_POINTS {
-        return vec![0; count];
+///
+/// Each point's normal comes from the points in the smallest cube centred on it, with a half
+/// edge of `edge` (the leaf's) halved up to [`MAX_HALVINGS`] times, that holds [`MIN_POINTS`]
+/// of them; points on its boundary count. The positions must be the source's own: points on a
+/// boundary would fall in or out under any shift.
+pub fn estimate_codes(points: &[[f64; 3]], edge: f64) -> Vec<u16> {
+    if points.len() < MIN_POINTS {
+        return vec![0; points.len()];
     }
-    // Centring keeps the arithmetic well conditioned and changes no covariance.
-    let mut mean = [0.0; 3];
-    for point in points {
-        for axis in 0..3 {
-            mean[axis] += point[axis];
-        }
-    }
-    let mean = mean.map(|sum| sum / count as f64);
-    let centred: Vec<[f64; 3]> =
-        points.iter().map(|point| [point[0] - mean[0], point[1] - mean[1], point[2] - mean[2]]).collect();
-
-    if count <= NEIGHBOURS {
-        let all: Vec<u32> = (0..count as u32).collect();
-        let code = encode(smallest_eigenvector(covariance(&centred, &all)));
-        return vec![code; count];
-    }
-    let tree = KdTree::build(&centred);
-    centred
+    let tree = KdTree::build(points);
+    points
         .par_iter()
-        .map_init(Vec::new, |neighbours, point| {
-            tree.nearest(*point, NEIGHBOURS, neighbours);
-            encode(smallest_eigenvector(covariance(&centred, neighbours)))
+        .map_init(Vec::new, |inside, &point| {
+            let half_edge = cube_half_edge(tree.kth_distance(point, MIN_POINTS), edge);
+            tree.within(point, half_edge, inside);
+            inside.sort_unstable();
+            encode_estimated(smallest_eigenvector(covariance(points, inside)))
         })
         .collect()
+}
+
+/// The half edge `edge / 2^j` of the smallest cube, `j` up to [`MAX_HALVINGS`], that reaches
+/// `distance` (the largest coordinate difference to a point).
+fn cube_half_edge(distance: f64, edge: f64) -> f64 {
+    let mut halvings = if distance > 0.0 {
+        (edge / distance).log2().floor().clamp(0.0, f64::from(MAX_HALVINGS)) as i32
+    } else {
+        MAX_HALVINGS
+    };
+    // The logarithm may round across a power of two; settle on the exact comparison.
+    for _ in 0..2 {
+        if halvings < MAX_HALVINGS && edge / 2f64.powi(halvings + 1) >= distance {
+            halvings += 1;
+        }
+        if halvings > 0 && edge / 2f64.powi(halvings) < distance {
+            halvings -= 1;
+        }
+    }
+    edge / 2f64.powi(halvings)
 }
 
 /// The covariance of the points picked by `indices`, centred on their mean and divided by
@@ -194,7 +227,7 @@ fn smallest_eigenvector(covariance: [[f64; 3]; 3]) -> [f64; 3] {
 /// Points per leaf of the k-d tree.
 const KD_LEAF_POINTS: usize = 8;
 
-/// A k-d tree for nearest-neighbour queries.
+/// A k-d tree for neighbour queries by the largest coordinate difference.
 struct KdTree<'a> {
     points: &'a [[f64; 3]],
     /// Point indices, arranged so that every node covers a contiguous range.
@@ -252,43 +285,67 @@ impl<'a> KdTree<'a> {
         index
     }
 
-    /// Fills `result` with the indices of the `k` points nearest to `query`, nearest first.
-    /// Equally distant points are taken in index order.
-    fn nearest(&self, query: [f64; 3], k: usize, result: &mut Vec<u32>) {
-        let mut best: Vec<(f64, u32)> = Vec::with_capacity(k + 1);
-        self.search(0, query, k, &mut best);
-        result.clear();
-        result.extend(best.iter().map(|&(_, index)| index));
+    /// The distance from `query` to its `k`-th nearest point, the query itself counted when it is
+    /// one of the points. Distances are the largest coordinate difference.
+    fn kth_distance(&self, query: [f64; 3], k: usize) -> f64 {
+        let mut best: Vec<f64> = Vec::with_capacity(k + 1);
+        self.search_nearest(0, query, k, &mut best);
+        best.last().copied().unwrap_or(f64::INFINITY)
     }
 
-    fn search(&self, node: usize, query: [f64; 3], k: usize, best: &mut Vec<(f64, u32)>) {
+    fn search_nearest(&self, node: usize, query: [f64; 3], k: usize, best: &mut Vec<f64>) {
         match self.nodes[node] {
             KdNode::Leaf { start, end } => {
                 for &index in &self.order[start..end] {
-                    let point = self.points[index as usize];
-                    let d = [point[0] - query[0], point[1] - query[1], point[2] - query[2]];
-                    let distance = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                    let candidate = (distance, index);
-                    let closer =
-                        |other: &(f64, u32)| candidate.0 < other.0 || (candidate.0 == other.0 && index < other.1);
-                    if best.len() == k && !best.last().is_some_and(closer) {
+                    let distance = distance(self.points[index as usize], query);
+                    if best.len() == k && distance >= best[k - 1] {
                         continue;
                     }
-                    let at = best.iter().position(closer).unwrap_or(best.len());
-                    best.insert(at, candidate);
+                    let at = best.partition_point(|&other| other <= distance);
+                    best.insert(at, distance);
                     best.truncate(k);
                 }
             }
             KdNode::Inner { axis, split, low, high } => {
                 let offset = query[axis] - split;
                 let (near, far) = if offset <= 0.0 { (low, high) } else { (high, low) };
-                self.search(near, query, k, best);
-                if best.len() < k || offset * offset <= best[best.len() - 1].0 {
-                    self.search(far, query, k, best);
+                self.search_nearest(near, query, k, best);
+                if best.len() < k || offset.abs() <= best[k - 1] {
+                    self.search_nearest(far, query, k, best);
                 }
             }
         }
     }
+
+    /// Fills `result` with the indices of the points at most `reach` from `query`, in no
+    /// particular order.
+    fn within(&self, query: [f64; 3], reach: f64, result: &mut Vec<u32>) {
+        result.clear();
+        self.search_within(0, query, reach, result);
+    }
+
+    fn search_within(&self, node: usize, query: [f64; 3], reach: f64, result: &mut Vec<u32>) {
+        match self.nodes[node] {
+            KdNode::Leaf { start, end } => {
+                let inside = |&&index: &&u32| distance(self.points[index as usize], query) <= reach;
+                result.extend(self.order[start..end].iter().filter(inside));
+            }
+            KdNode::Inner { axis, split, low, high } => {
+                let offset = query[axis] - split;
+                if offset <= reach {
+                    self.search_within(low, query, reach, result);
+                }
+                if -offset <= reach {
+                    self.search_within(high, query, reach, result);
+                }
+            }
+        }
+    }
+}
+
+/// The largest coordinate difference between two points.
+fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (a[0] - b[0]).abs().max((a[1] - b[1]).abs()).max((a[2] - b[2]).abs())
 }
 
 #[cfg(test)]
@@ -315,6 +372,35 @@ mod tests {
     }
 
     #[test]
+    fn estimated_normals_prefer_y_then_x_on_ties() {
+        let face = |code: u16| code as usize / FACE_CODES;
+        let ties = [[1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 1.0, 1.0]];
+        assert_eq!(ties.map(|v| face(encode(v))), [0, 0, 2, 0]);
+        assert_eq!(ties.map(|v| face(encode_estimated(v))), [2, 0, 2, 2]);
+        // Equal in single precision is a tie too.
+        assert_eq!(face(encode_estimated([1.0 + 1e-12, 1.0, 0.0])), 2);
+        assert_eq!(encode_estimated([1.0, 0.5, 0.2]), encode([1.0, 0.5, 0.2]));
+    }
+
+    #[test]
+    fn the_cube_is_the_smallest_holding_enough_points() {
+        let edge = 0.16;
+        // Nine points within 16 mm of the first one: the 20 mm cube holds them.
+        let mut points: Vec<[f64; 3]> = vec![[0.08, 0.08, 0.05]];
+        points.extend((1..9).map(|step| [0.08 + step as f64 * 0.002, 0.08, 0.05]));
+        points.push([0.15, 0.15, 0.05]);
+        let tree = KdTree::build(&points);
+        assert_eq!(cube_half_edge(tree.kth_distance(points[0], MIN_POINTS), edge), edge / 8.0);
+        points[8][0] = 0.08 + 0.0205;
+        let tree = KdTree::build(&points);
+        assert_eq!(cube_half_edge(tree.kth_distance(points[0], MIN_POINTS), edge), edge / 4.0);
+        // Exactly on a power of two, and the limits.
+        assert_eq!(cube_half_edge(0.02, edge), 0.02);
+        assert_eq!(cube_half_edge(0.0, edge), edge / 65536.0);
+        assert_eq!(cube_half_edge(1.0, edge), edge);
+    }
+
+    #[test]
     fn planes_get_their_normal() {
         // A tilted plane z = 0.5 x with some spread in y.
         let points: Vec<[f64; 3]> = (0..400)
@@ -324,7 +410,7 @@ mod tests {
             })
             .collect();
         let want = [-0.5, 0.0, 1.0].map(|v: f64| v / 1.25f64.sqrt());
-        for code in estimate_codes(&points) {
+        for code in estimate_codes(&points, 0.5) {
             let got = decode(code);
             let dot: f64 = (0..3).map(|axis| f64::from(got[axis]) * want[axis]).sum();
             assert!(dot.abs() > 0.995, "{got:?}");
@@ -334,34 +420,33 @@ mod tests {
     #[test]
     fn small_leaves_get_no_normals() {
         let points: Vec<[f64; 3]> = (0..8).map(|i| [i as f64, (i * i) as f64, 0.0]).collect();
-        assert_eq!(estimate_codes(&points), vec![0; 8]);
+        assert_eq!(estimate_codes(&points, 64.0), vec![0; 8]);
     }
 
     #[test]
-    fn nearest_neighbours_match_brute_force() {
+    fn neighbour_queries_match_brute_force() {
         let mut state = 12345u64;
         let mut random = || {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            (state % 10_000) as f64 / 1000.0
+            // A coarse grid, so that many distances tie.
+            (state % 200) as f64 / 100.0
         };
         let points: Vec<[f64; 3]> = (0..2000).map(|_| [random(), random(), random()]).collect();
         let tree = KdTree::build(&points);
         let mut found = Vec::new();
         for query in points.iter().step_by(37) {
-            tree.nearest(*query, NEIGHBOURS, &mut found);
-            let mut all: Vec<(f64, u32)> = points
-                .iter()
-                .enumerate()
-                .map(|(index, p)| {
-                    let d = [p[0] - query[0], p[1] - query[1], p[2] - query[2]];
-                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2], index as u32)
-                })
-                .collect();
-            all.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            let want: Vec<u32> = all[..NEIGHBOURS].iter().map(|&(_, index)| index).collect();
-            assert_eq!(found, want);
+            let mut all: Vec<f64> = points.iter().map(|&p| distance(p, *query)).collect();
+            all.sort_by(f64::total_cmp);
+            assert_eq!(tree.kth_distance(*query, MIN_POINTS), all[MIN_POINTS - 1]);
+            for reach in [0.0, 0.05, 0.13] {
+                tree.within(*query, reach, &mut found);
+                found.sort_unstable();
+                let want: Vec<u32> =
+                    (0..points.len() as u32).filter(|&i| distance(points[i as usize], *query) <= reach).collect();
+                assert_eq!(found, want);
+            }
         }
     }
 }
